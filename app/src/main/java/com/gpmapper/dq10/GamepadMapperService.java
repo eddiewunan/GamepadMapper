@@ -2,10 +2,7 @@ package com.gpmapper.dq10;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
-import android.content.BroadcastReceiver;
 import android.content.Context;
-import android.content.Intent;
-import android.content.IntentFilter;
 import android.graphics.Color;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
@@ -24,14 +21,18 @@ import java.util.Map;
 
 /**
  * 手把映射核心服務：
- * 1. 用 onKeyEvent 攔截手把離散按鍵（DPAD/A/B/X/Y…），轉成螢幕上固定座標的點擊。
+ * 1. 用 onKeyEvent 攔截手把離散按鍵（DPAD/A/B/X/Y/L1/R1/L2/R2…），轉成螢幕上固定座標的點擊或滑動。
  *    這部分完全不需要 focus，隨時都在運作，不影響系統其他操作。
  * 2. 用一個可取得 focus 的透明懸浮視窗接收左搖桿的類比訊號（onGenericMotionEvent），
  *    再用「延續中的手勢（continued gesture）」模擬手指按住拖曳，達成搖桿移動效果。
  *    ★ 這個視窗會搶走系統 focus，導致遊戲畫面可能整個變黑、系統手勢返回/長按失效，
- *    所以改成「手動開關」：預設不開啟，靠畫面上一顆小小的切換鈕手動啟用/停用，
- *    只有真的要移動角色時才短暫開啟，用完記得關掉。
+ *    所以改成「手動開關」：預設不開啟，靠畫面上的懸浮小按鈕手動啟用/停用。
  * 3. 提供「設定模式」：顯示可拖曳標記讓使用者自訂每個按鍵對應的螢幕座標。
+ * 4. 提供「測試模式」：即時顯示手把送出的 keyCode/軸值，方便確認實際訊號。
+ *
+ * 這三個功能（搖桿收訊、設定模式、測試模式）統一用「常駐的懸浮小按鈕」開關，
+ * 不需要離開目前的遊戲、也不需要切換 App，直接在遊戲畫面上點懸浮按鈕即可切換，
+ * 避免了「切回 GamepadMapper 這個 App 再想辦法跳回遊戲」的麻煩與不可靠。
  *
  * 已知限制（實測前務必留意）：
  * - 開啟搖桿收訊的當下，遊戲視窗一定會失去 focus；如果遊戲對 focus 遺失敏感
@@ -40,9 +41,6 @@ import java.util.Map;
  *   目前實作未特別處理兩者的手勢合併，可能出現其中一個動作被中斷的狀況。
  */
 public class GamepadMapperService extends AccessibilityService {
-
-    public static final String ACTION_TOGGLE_CONFIG = "com.gpmapper.dq10.ACTION_TOGGLE_CONFIG";
-    public static final String ACTION_TOGGLE_TEST_MODE = "com.gpmapper.dq10.ACTION_TOGGLE_TEST_MODE";
 
     // 目前支援映射的按鍵清單，要跟 ConfigOverlay 裡建立的標記一致
     private static final int[] SUPPORTED_KEYCODES = {
@@ -62,15 +60,19 @@ public class GamepadMapperService extends AccessibilityService {
     private static final long SWIPE_DURATION_MS = 120L;   // L2/R2 滑動手勢的持續時間
 
     private WindowManager windowManager;
-    private View joystickCaptureView;      // 只在使用者手動開啟時才存在：拿 focus 收搖桿訊號
-    private TextView toggleButton;         // 永遠存在的小按鈕，不搶 focus，用來手動開/關搖桿收訊
-    private WindowManager.LayoutParams toggleButtonParams;
+    private View joystickCaptureView;      // 只在手動開啟時才存在：拿 focus 收搖桿訊號
     private boolean joystickCaptureEnabled = false;
+
     private ConfigOverlay configOverlay;   // 設定模式時顯示的可拖曳標記層
     private boolean inConfigMode = false;
 
     private TextView testLabel;            // 測試模式用的小提示框，顯示即時 keyCode/軸值
     private boolean testMode = false;
+
+    // 常駐的三顆懸浮控制鈕：搖桿收訊 / 設定模式 / 測試模式，全部 FLAG_NOT_FOCUSABLE，不影響系統操作
+    private FloatingButton joystickButton;
+    private FloatingButton configButton;
+    private FloatingButton testButton;
 
     private MappingStore mappingStore;
     private Map<Integer, PointF> buttonMap = new HashMap<>();
@@ -81,17 +83,6 @@ public class GamepadMapperService extends AccessibilityService {
     private GestureDescription.StrokeDescription activeJoystickStroke;
     private PointF lastJoystickPoint;
 
-    private final BroadcastReceiver configReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            if (ACTION_TOGGLE_CONFIG.equals(intent.getAction())) {
-                toggleConfigMode();
-            } else if (ACTION_TOGGLE_TEST_MODE.equals(intent.getAction())) {
-                setTestModeEnabled(!testMode);
-            }
-        }
-    };
-
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
@@ -99,15 +90,7 @@ public class GamepadMapperService extends AccessibilityService {
         reloadMapping();
 
         windowManager = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
-        addToggleButton(); // 只加這顆小按鈕，不會搶 focus，系統操作完全不受影響
-
-        IntentFilter filter = new IntentFilter(ACTION_TOGGLE_CONFIG);
-        filter.addAction(ACTION_TOGGLE_TEST_MODE);
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(configReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
-        } else {
-            registerReceiver(configReceiver, filter);
-        }
+        addControlButtons();
     }
 
     private void reloadMapping() {
@@ -116,69 +99,25 @@ public class GamepadMapperService extends AccessibilityService {
         joystickRadius = mappingStore.getJoystickRadius();
     }
 
-    /**
-     * 建立永遠存在的小切換鈕：FLAG_NOT_FOCUSABLE，絕對不會搶系統 focus，
-     * 也不影響手勢返回/長按等系統操作。點一下才切換搖桿收訊的開/關。
-     * 按住可以拖曳到畫面上不擋視線的角落。
-     */
-    private void addToggleButton() {
-        toggleButton = new TextView(this);
-        updateToggleButtonLabel();
-        toggleButton.setTextColor(Color.WHITE);
-        toggleButton.setBackgroundColor(Color.argb(180, 0, 0, 0));
-        toggleButton.setPadding(20, 12, 20, 12);
-
-        toggleButtonParams = new WindowManager.LayoutParams(
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, // 關鍵：這顆按鈕永遠不搶 focus
-                PixelFormat.TRANSLUCENT);
-        toggleButtonParams.gravity = Gravity.TOP | Gravity.START;
-        toggleButtonParams.x = 0;
-        toggleButtonParams.y = 200;
-
-        toggleButton.setOnTouchListener(new View.OnTouchListener() {
-            float downRawX, downRawY, downX, downY;
-            static final int CLICK_THRESHOLD = 20;
-
-            @Override
-            public boolean onTouch(View v, MotionEvent event) {
-                switch (event.getAction()) {
-                    case MotionEvent.ACTION_DOWN:
-                        downRawX = event.getRawX();
-                        downRawY = event.getRawY();
-                        downX = toggleButtonParams.x;
-                        downY = toggleButtonParams.y;
-                        return true;
-                    case MotionEvent.ACTION_MOVE:
-                        toggleButtonParams.x = (int) (downX + (event.getRawX() - downRawX));
-                        toggleButtonParams.y = (int) (downY + (event.getRawY() - downRawY));
-                        windowManager.updateViewLayout(toggleButton, toggleButtonParams);
-                        return true;
-                    case MotionEvent.ACTION_UP:
-                        float moved = Math.abs(event.getRawX() - downRawX) + Math.abs(event.getRawY() - downRawY);
-                        if (moved < CLICK_THRESHOLD) {
-                            setJoystickCaptureEnabled(!joystickCaptureEnabled);
-                        }
-                        return true;
-                }
-                return false;
-            }
-        });
-
-        windowManager.addView(toggleButton, toggleButtonParams);
+    /** 建立三顆常駐懸浮控制鈕，垂直排列在畫面左側，可各自拖曳到不擋視線的位置 */
+    private void addControlButtons() {
+        joystickButton = new FloatingButton(200, () -> setJoystickCaptureEnabled(!joystickCaptureEnabled));
+        configButton = new FloatingButton(280, this::toggleConfigMode);
+        testButton = new FloatingButton(360, () -> setTestModeEnabled(!testMode));
+        refreshButtonLabels();
     }
 
-    private void updateToggleButtonLabel() {
-        toggleButton.setText(joystickCaptureEnabled ? "🎮搖桿:開" : "🎮搖桿:關");
+    private void refreshButtonLabels() {
+        if (joystickButton != null) joystickButton.setLabel(joystickCaptureEnabled ? "🎮搖桿:開" : "🎮搖桿:關");
+        if (configButton != null) configButton.setLabel(inConfigMode ? "⚙設定:開" : "⚙設定:關");
+        if (testButton != null) testButton.setLabel(testMode ? "🔍測試:開" : "🔍測試:關");
     }
 
     /** 手動開關搖桿收訊。開啟時才會加入會搶 focus 的懸浮視窗，關閉時立即移除還給系統。 */
     private void setJoystickCaptureEnabled(boolean enabled) {
         if (enabled == joystickCaptureEnabled) return;
         joystickCaptureEnabled = enabled;
-        updateToggleButtonLabel();
+        refreshButtonLabels();
 
         if (enabled) {
             joystickCaptureView = new View(this) {
@@ -206,8 +145,14 @@ public class GamepadMapperService extends AccessibilityService {
         }
     }
 
+    /**
+     * 設定模式：直接在目前畫面（不管是不是遊戲畫面）疊上可拖曳的按鍵標記。
+     * 因為是懸浮視窗，只要遊戲已經在背景／前景，切換過去後標記仍然會顯示在遊戲畫面最上層，
+     * 不需要透過本 App 的 Activity 去「跳轉」到遊戲，直接用手機原本的切換視窗方式切過去即可。
+     */
     private void toggleConfigMode() {
         inConfigMode = !inConfigMode;
+        refreshButtonLabels();
         if (inConfigMode) {
             setJoystickCaptureEnabled(false); // 設定模式下不需要搖桿收訊，避免互相干擾
             showConfigOverlay();
@@ -224,6 +169,7 @@ public class GamepadMapperService extends AccessibilityService {
     private void setTestModeEnabled(boolean enabled) {
         if (enabled == testMode) return;
         testMode = enabled;
+        refreshButtonLabels();
 
         if (enabled) {
             addTestLabelIfNeeded();
@@ -426,12 +372,78 @@ public class GamepadMapperService extends AccessibilityService {
     @Override
     public void onDestroy() {
         super.onDestroy();
-        unregisterReceiver(configReceiver);
         if (windowManager != null) {
-            if (toggleButton != null) windowManager.removeView(toggleButton);
+            if (joystickButton != null) joystickButton.remove();
+            if (configButton != null) configButton.remove();
+            if (testButton != null) testButton.remove();
             if (joystickCaptureView != null) windowManager.removeView(joystickCaptureView);
             if (testLabel != null) windowManager.removeView(testLabel);
             hideConfigOverlay();
+        }
+    }
+
+    /**
+     * 常駐懸浮小按鈕：FLAG_NOT_FOCUSABLE，絕對不會搶系統 focus，不影響手勢返回/長按等系統操作，
+     * 也不管目前在哪個 App 都會顯示在最上層。按住可拖曳到不擋視線的位置，輕點（移動距離很小）才會觸發 onTap。
+     */
+    private class FloatingButton {
+        private final TextView view;
+        private final WindowManager.LayoutParams params;
+
+        FloatingButton(int defaultYPx, Runnable onTap) {
+            view = new TextView(GamepadMapperService.this);
+            view.setTextColor(Color.WHITE);
+            view.setBackgroundColor(Color.argb(180, 0, 0, 0));
+            view.setPadding(20, 12, 20, 12);
+
+            params = new WindowManager.LayoutParams(
+                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    WindowManager.LayoutParams.WRAP_CONTENT,
+                    WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, // 關鍵：永遠不搶 focus
+                    PixelFormat.TRANSLUCENT);
+            params.gravity = Gravity.TOP | Gravity.START;
+            params.x = 0;
+            params.y = defaultYPx;
+
+            view.setOnTouchListener(new View.OnTouchListener() {
+                float downRawX, downRawY, downX, downY;
+                static final int CLICK_THRESHOLD = 20;
+
+                @Override
+                public boolean onTouch(View v, MotionEvent event) {
+                    switch (event.getAction()) {
+                        case MotionEvent.ACTION_DOWN:
+                            downRawX = event.getRawX();
+                            downRawY = event.getRawY();
+                            downX = params.x;
+                            downY = params.y;
+                            return true;
+                        case MotionEvent.ACTION_MOVE:
+                            params.x = (int) (downX + (event.getRawX() - downRawX));
+                            params.y = (int) (downY + (event.getRawY() - downRawY));
+                            windowManager.updateViewLayout(view, params);
+                            return true;
+                        case MotionEvent.ACTION_UP:
+                            float moved = Math.abs(event.getRawX() - downRawX) + Math.abs(event.getRawY() - downRawY);
+                            if (moved < CLICK_THRESHOLD) {
+                                onTap.run();
+                            }
+                            return true;
+                    }
+                    return false;
+                }
+            });
+
+            windowManager.addView(view, params);
+        }
+
+        void setLabel(String text) {
+            view.setText(text);
+        }
+
+        void remove() {
+            windowManager.removeView(view);
         }
     }
 }

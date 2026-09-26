@@ -5,7 +5,6 @@ import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
 import android.provider.Settings;
-import android.widget.Toast;
 
 public class MainActivity extends Activity {
 
@@ -23,24 +22,8 @@ public class MainActivity extends Activity {
             startActivity(intent);
         });
 
-        findViewById(R.id.btnConfig).setOnClickListener(v -> {
-            // 通知無障礙服務切換到「設定模式」，顯示可拖曳的按鍵位置標記
-            Intent intent = new Intent(GamepadMapperService.ACTION_TOGGLE_CONFIG);
-            intent.setPackage(getPackageName());
-            sendBroadcast(intent);
-            Toast.makeText(this, "已切換設定模式，請到遊戲畫面上拖曳標記並按「儲存位置」",
-                    Toast.LENGTH_LONG).show();
-            moveTaskToBack(true); // 退到背景，讓遊戲畫面顯示出來
-        });
-
-        findViewById(R.id.btnTestMode).setOnClickListener(v -> {
-            // 通知無障礙服務切換「按鍵測試模式」，畫面上會即時顯示按下的 keyCode 與搖桿軸值
-            Intent intent = new Intent(GamepadMapperService.ACTION_TOGGLE_TEST_MODE);
-            intent.setPackage(getPackageName());
-            sendBroadcast(intent);
-            Toast.makeText(this, "已切換測試模式，請按手把按鍵或推動搖桿觀察畫面下方提示",
-                    Toast.LENGTH_LONG).show();
-            moveTaskToBack(true);
-        });
+        // 設定模式與測試模式已經改成常駐的懸浮小按鈕（🎮/⚙/🔍），
+        // 不需要再透過這個 App 的畫面觸發，兩個權限開啟後直接切到遊戲，
+        // 用懸浮按鈕操作即可，不用再切換回這個 App。
     }
 }
