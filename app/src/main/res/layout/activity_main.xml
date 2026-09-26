@@ -33,11 +33,18 @@
         android:layout_marginBottom="16dp"
         android:text="3. 進入按鍵位置設定模式" />
 
+    <Button
+        android:id="@+id/btnTestMode"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="16dp"
+        android:text="4. 開啟/關閉按鍵測試模式" />
+
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="16dp"
-        android:text="使用方式：先完成 1、2 兩個權限，接著切到 DQ10 遊戲畫面，回來點「3」進入設定模式，拖曳畫面上的紅色/藍色標記到遊戲對應的按鈕位置，按「儲存位置」即可。"
+        android:text="使用方式：先完成 1、2 兩個權限，接著切到 DQ10 遊戲畫面，回來點「3」進入設定模式，拖曳畫面上的紅色/藍色/紫色標記到遊戲對應的按鈕位置，按「儲存位置」即可。若不確定手把按鍵送出的實際代碼，先點「4」開啟測試模式，畫面下方會即時顯示按下的按鍵名稱與搖桿數值，再點一次「4」關閉。"
         android:textSize="14sp" />
 
 </LinearLayout>

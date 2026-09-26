@@ -42,6 +42,7 @@ import java.util.Map;
 public class GamepadMapperService extends AccessibilityService {
 
     public static final String ACTION_TOGGLE_CONFIG = "com.gpmapper.dq10.ACTION_TOGGLE_CONFIG";
+    public static final String ACTION_TOGGLE_TEST_MODE = "com.gpmapper.dq10.ACTION_TOGGLE_TEST_MODE";
 
     // 目前支援映射的按鍵清單，要跟 ConfigOverlay 裡建立的標記一致
     private static final int[] SUPPORTED_KEYCODES = {
@@ -49,12 +50,16 @@ public class GamepadMapperService extends AccessibilityService {
             KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT,
             KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_BUTTON_B,
             KeyEvent.KEYCODE_BUTTON_X, KeyEvent.KEYCODE_BUTTON_Y,
-            KeyEvent.KEYCODE_BUTTON_START, KeyEvent.KEYCODE_BUTTON_SELECT
+            KeyEvent.KEYCODE_BUTTON_START, KeyEvent.KEYCODE_BUTTON_SELECT,
+            KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_R1,
+            KeyEvent.KEYCODE_BUTTON_L2, KeyEvent.KEYCODE_BUTTON_R2
     };
 
     private static final float JOYSTICK_DEADZONE = 0.25f;
     private static final long JOYSTICK_UPDATE_DURATION_MS = 60L; // 每段延續手勢的持續時間
     private static final long TAP_DURATION_MS = 50L;
+    private static final float SWIPE_DISTANCE_PX = 300f;  // L2/R2 觸發的滑動距離
+    private static final long SWIPE_DURATION_MS = 120L;   // L2/R2 滑動手勢的持續時間
 
     private WindowManager windowManager;
     private View joystickCaptureView;      // 只在使用者手動開啟時才存在：拿 focus 收搖桿訊號
@@ -63,6 +68,9 @@ public class GamepadMapperService extends AccessibilityService {
     private boolean joystickCaptureEnabled = false;
     private ConfigOverlay configOverlay;   // 設定模式時顯示的可拖曳標記層
     private boolean inConfigMode = false;
+
+    private TextView testLabel;            // 測試模式用的小提示框，顯示即時 keyCode/軸值
+    private boolean testMode = false;
 
     private MappingStore mappingStore;
     private Map<Integer, PointF> buttonMap = new HashMap<>();
@@ -78,6 +86,8 @@ public class GamepadMapperService extends AccessibilityService {
         public void onReceive(Context context, Intent intent) {
             if (ACTION_TOGGLE_CONFIG.equals(intent.getAction())) {
                 toggleConfigMode();
+            } else if (ACTION_TOGGLE_TEST_MODE.equals(intent.getAction())) {
+                setTestModeEnabled(!testMode);
             }
         }
     };
@@ -92,6 +102,7 @@ public class GamepadMapperService extends AccessibilityService {
         addToggleButton(); // 只加這顆小按鈕，不會搶 focus，系統操作完全不受影響
 
         IntentFilter filter = new IntentFilter(ACTION_TOGGLE_CONFIG);
+        filter.addAction(ACTION_TOGGLE_TEST_MODE);
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(configReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
         } else {
@@ -205,6 +216,49 @@ public class GamepadMapperService extends AccessibilityService {
         }
     }
 
+    /**
+     * 測試模式：手把按什麼鍵、搖桿/十字鍵推到哪個數值，都會即時顯示在畫面小提示框上，
+     * 但不會真的觸發點擊/滑動手勢，避免測試時誤觸遊戲畫面。
+     * 開啟測試模式會順便打開搖桿收訊（因為要測到類比軸的數值），關閉時一併關掉。
+     */
+    private void setTestModeEnabled(boolean enabled) {
+        if (enabled == testMode) return;
+        testMode = enabled;
+
+        if (enabled) {
+            addTestLabelIfNeeded();
+            testLabel.setVisibility(View.VISIBLE);
+            setJoystickCaptureEnabled(true);
+            showTestInfo("測試模式已開啟\n按手把按鍵，或推動搖桿/十字鍵看看數值");
+        } else {
+            if (testLabel != null) testLabel.setVisibility(View.GONE);
+            setJoystickCaptureEnabled(false);
+        }
+    }
+
+    private void addTestLabelIfNeeded() {
+        if (testLabel != null) return;
+        testLabel = new TextView(this);
+        testLabel.setTextColor(Color.WHITE);
+        testLabel.setBackgroundColor(Color.argb(200, 0, 0, 0));
+        testLabel.setPadding(24, 16, 24, 16);
+        testLabel.setText("測試模式待命中…");
+
+        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                PixelFormat.TRANSLUCENT);
+        params.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+        params.y = 100;
+        windowManager.addView(testLabel, params);
+    }
+
+    private void showTestInfo(String text) {
+        if (testLabel != null) testLabel.setText(text);
+    }
+
     private void showConfigOverlay() {
         configOverlay = new ConfigOverlay(this);
         configOverlay.setOnSaveListener(() -> {
@@ -238,11 +292,26 @@ public class GamepadMapperService extends AccessibilityService {
                 || (source & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK;
         if (!isGamepadKey) return false;
 
+        if (testMode) {
+            // 測試模式：只顯示這顆按鍵實際送出的 keyCode，不做任何映射動作
+            String actionName = (event.getAction() == KeyEvent.ACTION_DOWN) ? "DOWN" : "UP";
+            showTestInfo("按鍵事件\nkeyCode=" + event.getKeyCode()
+                    + "\n名稱=" + KeyEvent.keyCodeToString(event.getKeyCode())
+                    + "\n動作=" + actionName);
+            return true;
+        }
+
         PointF target = buttonMap.get(event.getKeyCode());
         if (target == null) return false; // 這個按鍵還沒設定位置，交還給系統預設處理
 
         if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
-            dispatchTap(target);
+            if (event.getKeyCode() == KeyEvent.KEYCODE_BUTTON_L2) {
+                dispatchSwipe(target, -1); // 向左滑
+            } else if (event.getKeyCode() == KeyEvent.KEYCODE_BUTTON_R2) {
+                dispatchSwipe(target, 1);  // 向右滑
+            } else {
+                dispatchTap(target);
+            }
         }
         return true; // 消費掉這個按鍵事件
     }
@@ -256,7 +325,30 @@ public class GamepadMapperService extends AccessibilityService {
         dispatchGesture(gesture, null, null);
     }
 
+    /** L2/R2 專用：從設定的起點做一個固定距離的橫向滑動（快速拖曳），direction 為 -1（左）或 1（右） */
+    private void dispatchSwipe(PointF start, int direction) {
+        Path path = new Path();
+        path.moveTo(start.x, start.y);
+        path.lineTo(start.x + direction * SWIPE_DISTANCE_PX, start.y);
+        GestureDescription.StrokeDescription stroke =
+                new GestureDescription.StrokeDescription(path, 0, SWIPE_DURATION_MS);
+        dispatchGesture(new GestureDescription.Builder().addStroke(stroke).build(), null, null);
+    }
+
     private void handleJoystickMotion(MotionEvent event) {
+        if (testMode) {
+            // 測試模式：把搖桿與十字鍵可能用到的軸值都顯示出來，方便確認手把實際送出的是哪一種訊號
+            // （某些手把的十字鍵是用 HAT 軸而不是按鍵事件送出，這裡可以直接看出來）
+            float x = event.getAxisValue(MotionEvent.AXIS_X);
+            float y = event.getAxisValue(MotionEvent.AXIS_Y);
+            float hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X);
+            float hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y);
+            showTestInfo(String.format(
+                    "搖桿軸值\nAXIS_X=%.2f AXIS_Y=%.2f\nHAT_X=%.2f HAT_Y=%.2f",
+                    x, y, hatX, hatY));
+            return; // 測試模式下不觸發實際手勢
+        }
+
         if (joystickAnchor == null) return; // 尚未在設定模式裡設定搖桿中心位置
 
         float x = event.getAxisValue(MotionEvent.AXIS_X);
@@ -338,6 +430,7 @@ public class GamepadMapperService extends AccessibilityService {
         if (windowManager != null) {
             if (toggleButton != null) windowManager.removeView(toggleButton);
             if (joystickCaptureView != null) windowManager.removeView(joystickCaptureView);
+            if (testLabel != null) windowManager.removeView(testLabel);
             hideConfigOverlay();
         }
     }

@@ -32,5 +32,15 @@ public class MainActivity extends Activity {
                     Toast.LENGTH_LONG).show();
             moveTaskToBack(true); // 退到背景，讓遊戲畫面顯示出來
         });
+
+        findViewById(R.id.btnTestMode).setOnClickListener(v -> {
+            // 通知無障礙服務切換「按鍵測試模式」，畫面上會即時顯示按下的 keyCode 與搖桿軸值
+            Intent intent = new Intent(GamepadMapperService.ACTION_TOGGLE_TEST_MODE);
+            intent.setPackage(getPackageName());
+            sendBroadcast(intent);
+            Toast.makeText(this, "已切換測試模式，請按手把按鍵或推動搖桿觀察畫面下方提示",
+                    Toast.LENGTH_LONG).show();
+            moveTaskToBack(true);
+        });
     }
 }
