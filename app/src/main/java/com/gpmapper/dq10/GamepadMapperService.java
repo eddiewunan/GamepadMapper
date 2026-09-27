@@ -21,24 +21,27 @@ import java.util.Map;
 
 /**
  * 手把映射核心服務：
- * 1. 用 onKeyEvent 攔截手把離散按鍵（DPAD/A/B/X/Y/L1/R1/L2/R2…），轉成螢幕上固定座標的點擊或滑動。
+ * 1. 用 onKeyEvent 攔截手把離散按鍵（DPAD/A/B/X/Y/L1/R1/L2/R2/MODE…），轉成螢幕上固定座標的點擊或滑動。
  *    這部分完全不需要 focus，隨時都在運作，不影響系統其他操作。
- * 2. 用一個可取得 focus 的透明懸浮視窗接收左搖桿的類比訊號（onGenericMotionEvent），
+ * 2. 用一個可取得 focus 的透明懸浮視窗接收左右搖桿的類比訊號（onGenericMotionEvent），
  *    再用「延續中的手勢（continued gesture）」模擬手指按住拖曳，達成搖桿移動效果。
+ *    左右搖桿若同時操作，會合併進「同一次」dispatchGesture 呼叫，
+ *    因為 Android 一次手勢呼叫代表當下所有手指的狀態，分開呼叫會讓後面那次打斷前一個。
  *    ★ 這個視窗會搶走系統 focus，導致遊戲畫面可能整個變黑、系統手勢返回/長按失效，
  *    所以改成「手動開關」：預設不開啟，靠畫面上的懸浮小按鈕手動啟用/停用。
  * 3. 提供「設定模式」：顯示可拖曳標記讓使用者自訂每個按鍵對應的螢幕座標。
  * 4. 提供「測試模式」：即時顯示手把送出的 keyCode/軸值，方便確認實際訊號。
  *
  * 這三個功能（搖桿收訊、設定模式、測試模式）統一用「常駐的懸浮小按鈕」開關，
- * 不需要離開目前的遊戲、也不需要切換 App，直接在遊戲畫面上點懸浮按鈕即可切換，
- * 避免了「切回 GamepadMapper 這個 App 再想辦法跳回遊戲」的麻煩與不可靠。
+ * 不需要離開目前的遊戲、也不需要切換 App，直接在遊戲畫面上點懸浮按鈕即可切換。
  *
  * 已知限制（實測前務必留意）：
  * - 開啟搖桿收訊的當下，遊戲視窗一定會失去 focus；如果遊戲對 focus 遺失敏感
  *   （黑畫面、暫停、靜音），代表這個遊戲的移動操作可能只能靠方向鍵/按鍵，搖桿不適用。
  * - 搖桿拖曳與按鍵點擊若「同時」發生（雙手同時操作），屬於多點觸控情境，
- *   目前實作未特別處理兩者的手勢合併，可能出現其中一個動作被中斷的狀況。
+ *   按鍵點擊目前是獨立呼叫 dispatchGesture，若跟搖桿拖曳同時觸發，可能會互相打斷。
+ * - L2/R2 若是手把上的類比扳機，系統可能只會送出瞬間的 DOWN+UP，收不到「持續按住」的狀態，
+ *   這種情況下無法做出真正的長按效果，是 Android 輸入框架的限制，不是本 App 的 bug。
  */
 public class GamepadMapperService extends AccessibilityService {
 
@@ -50,7 +53,8 @@ public class GamepadMapperService extends AccessibilityService {
             KeyEvent.KEYCODE_BUTTON_X, KeyEvent.KEYCODE_BUTTON_Y,
             KeyEvent.KEYCODE_BUTTON_START, KeyEvent.KEYCODE_BUTTON_SELECT,
             KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_R1,
-            KeyEvent.KEYCODE_BUTTON_L2, KeyEvent.KEYCODE_BUTTON_R2
+            KeyEvent.KEYCODE_BUTTON_L2, KeyEvent.KEYCODE_BUTTON_R2,
+            KeyEvent.KEYCODE_BUTTON_MODE
     };
 
     private static final float JOYSTICK_DEADZONE = 0.25f;
@@ -78,13 +82,20 @@ public class GamepadMapperService extends AccessibilityService {
 
     private MappingStore mappingStore;
     private Map<Integer, PointF> buttonMap = new HashMap<>();
-    private PointF joystickAnchor;
+    private PointF joystickAnchor;       // 左搖桿中心（AXIS_X / AXIS_Y）
+    private PointF rightJoystickAnchor;  // 右搖桿中心（AXIS_Z / AXIS_RZ）
     private float joystickRadius;
 
-    // 搖桿目前正在進行中的手勢，用來延續拖曳動作；lastJoystickPoint 記錄上一段路徑的終點
-    private GestureDescription.StrokeDescription activeJoystickStroke;
-    private PointF lastJoystickPoint;
     private long lastJoystickDispatchTime = 0L; // 節流用：避免同時塞太多段延續手勢造成佇列積壓
+
+    /** 每根搖桿各自的手勢延續狀態（左右各一份，才能同時拖著兩個點移動） */
+    private static class JoystickState {
+        GestureDescription.StrokeDescription activeStroke;
+        PointF lastPoint;
+    }
+
+    private final JoystickState leftJoystick = new JoystickState();
+    private final JoystickState rightJoystick = new JoystickState();
 
     @Override
     protected void onServiceConnected() {
@@ -99,6 +110,7 @@ public class GamepadMapperService extends AccessibilityService {
     private void reloadMapping() {
         buttonMap = mappingStore.loadAllButtons(SUPPORTED_KEYCODES);
         joystickAnchor = mappingStore.getJoystickAnchor();
+        rightJoystickAnchor = mappingStore.getRightJoystickAnchor();
         joystickRadius = mappingStore.getJoystickRadius();
     }
 
@@ -140,7 +152,7 @@ public class GamepadMapperService extends AccessibilityService {
             // 開啟期間遊戲視窗會失去 focus，是目前非 root 方案無法繞開的取捨，所以才做成手動開關。
             windowManager.addView(joystickCaptureView, params);
         } else {
-            releaseJoystick(); // 關閉前先把還在進行中的拖曳手勢收尾，避免手指卡在畫面上
+            releaseAllJoysticks(); // 關閉前先把還在進行中的拖曳手勢收尾，避免手指卡在畫面上
             if (joystickCaptureView != null) {
                 windowManager.removeView(joystickCaptureView);
                 joystickCaptureView = null;
@@ -151,7 +163,7 @@ public class GamepadMapperService extends AccessibilityService {
     /**
      * 設定模式：直接在目前畫面（不管是不是遊戲畫面）疊上可拖曳的按鍵標記。
      * 因為是懸浮視窗，只要遊戲已經在背景／前景，切換過去後標記仍然會顯示在遊戲畫面最上層，
-     * 不需要透過本 App 的 Activity 去「跳轉」到遊戲，直接用手機原本的切換視窗方式切過去即可。
+     * 不需要透過本 App 的 Activity 去「跳轉」到遊戲。
      */
     private void toggleConfigMode() {
         inConfigMode = !inConfigMode;
@@ -293,8 +305,6 @@ public class GamepadMapperService extends AccessibilityService {
         if (testMode) {
             // 測試模式：把左搖桿、右搖桿、十字鍵、L2/R2 扳機可能用到的軸都顯示出來，
             // 方便確認手把實際送出的是哪一種訊號、對應到哪個軸代碼。
-            // （不同手把/模式下，右搖桿可能是 AXIS_Z/AXIS_RZ 或 AXIS_RX/AXIS_RY；
-            //   扳機可能是 AXIS_LTRIGGER/AXIS_RTRIGGER 或 AXIS_BRAKE/AXIS_GAS，因裝置而異）
             float x = event.getAxisValue(MotionEvent.AXIS_X);
             float y = event.getAxisValue(MotionEvent.AXIS_Y);
             float z = event.getAxisValue(MotionEvent.AXIS_Z);
@@ -313,79 +323,130 @@ public class GamepadMapperService extends AccessibilityService {
             return; // 測試模式下不觸發實際手勢
         }
 
-        if (joystickAnchor == null) return; // 尚未在設定模式裡設定搖桿中心位置
+        handleRealJoystickMotion(event);
+    }
 
-        float x = event.getAxisValue(MotionEvent.AXIS_X);
-        float y = event.getAxisValue(MotionEvent.AXIS_Y);
-        float magnitude = (float) Math.sqrt(x * x + y * y);
+    /**
+     * 左右搖桿合併處理：每次收到訊號，同時檢查左右搖桿目前的狀態，
+     * 把「需要更新」的那幾根手指，合併進同一次 dispatchGesture 呼叫裡送出去。
+     * 這是必要的，因為 Android 一次 dispatchGesture 代表的是「當下所有手指」的狀態，
+     * 分開呼叫左搖桿一次、右搖桿一次，後面那次會把前一次的手指直接打斷。
+     */
+    private void handleRealJoystickMotion(MotionEvent event) {
+        boolean leftHasAnchor = joystickAnchor != null;
+        boolean rightHasAnchor = rightJoystickAnchor != null;
+        if (!leftHasAnchor && !rightHasAnchor) return; // 兩根搖桿都還沒在設定模式裡設定過中心點
 
-        if (magnitude < JOYSTICK_DEADZONE) {
-            releaseJoystick(); // 放開一定要立刻處理，不能被節流卡住，否則會延遲收尾
-            return;
+        float lx = event.getAxisValue(MotionEvent.AXIS_X);
+        float ly = event.getAxisValue(MotionEvent.AXIS_Y);
+        float rx = event.getAxisValue(MotionEvent.AXIS_Z);
+        float ry = event.getAxisValue(MotionEvent.AXIS_RZ);
+
+        float lMag = (float) Math.sqrt(lx * lx + ly * ly);
+        float rMag = (float) Math.sqrt(rx * rx + ry * ry);
+
+        boolean leftActive = leftHasAnchor && lMag >= JOYSTICK_DEADZONE;
+        boolean rightActive = rightHasAnchor && rMag >= JOYSTICK_DEADZONE;
+
+        boolean leftWasActive = leftJoystick.activeStroke != null;
+        boolean rightWasActive = rightJoystick.activeStroke != null;
+
+        if (!leftActive && !rightActive && !leftWasActive && !rightWasActive) {
+            return; // 兩邊都是中立、也沒有殘留中的手勢，完全不用處理
         }
 
-        // 節流：搖桿的 onGenericMotionEvent 觸發頻率遠高於每段延續手勢的播放時間（60ms），
-        // 如果每次收到訊號都塞一段新的手勢進去，快速畫一圈就會瞬間塞進十幾段，
-        // 系統必須照順序全部播完才會輪到「放開」那一下，變成放開後畫面還在「補動作」。
-        // 所以這裡限制送出頻率，跟每段手勢的播放時間對齊，避免佇列越疊越多。
+        // 節流：只有在「持續移動中」（不是剛開始按、也不是剛放開）才做頻率限制，
+        // 剛按下或剛放開的那一刻要立即處理，不能被節流卡住。
+        boolean justStartedOrEnded = (leftActive != leftWasActive) || (rightActive != rightWasActive);
         long now = System.currentTimeMillis();
-        if (now - lastJoystickDispatchTime < JOYSTICK_MIN_INTERVAL_MS) {
+        if (!justStartedOrEnded && now - lastJoystickDispatchTime < JOYSTICK_MIN_INTERVAL_MS) {
             return;
         }
         lastJoystickDispatchTime = now;
 
-        // 超過搖桿最大幅度時做正規化，避免超出可拖曳半徑
-        if (magnitude > 1f) {
-            x /= magnitude;
-            y /= magnitude;
+        GestureDescription.Builder builder = new GestureDescription.Builder();
+        boolean anyStroke = false;
+
+        if (leftActive) {
+            if (lMag > 1f) { lx /= lMag; ly /= lMag; }
+            float tx = joystickAnchor.x + lx * joystickRadius;
+            float ty = joystickAnchor.y + ly * joystickRadius;
+            GestureDescription.StrokeDescription stroke = buildMoveStroke(leftJoystick, joystickAnchor, tx, ty);
+            builder.addStroke(stroke);
+            leftJoystick.activeStroke = stroke;
+            leftJoystick.lastPoint = new PointF(tx, ty);
+            anyStroke = true;
+        } else if (leftWasActive) {
+            builder.addStroke(buildEndStroke(leftJoystick));
+            leftJoystick.activeStroke = null;
+            leftJoystick.lastPoint = null;
+            anyStroke = true;
         }
 
-        float targetX = joystickAnchor.x + x * joystickRadius;
-        float targetY = joystickAnchor.y + y * joystickRadius;
-        updateJoystickGesture(targetX, targetY);
+        if (rightActive) {
+            if (rMag > 1f) { rx /= rMag; ry /= rMag; }
+            float tx = rightJoystickAnchor.x + rx * joystickRadius;
+            float ty = rightJoystickAnchor.y + ry * joystickRadius;
+            GestureDescription.StrokeDescription stroke = buildMoveStroke(rightJoystick, rightJoystickAnchor, tx, ty);
+            builder.addStroke(stroke);
+            rightJoystick.activeStroke = stroke;
+            rightJoystick.lastPoint = new PointF(tx, ty);
+            anyStroke = true;
+        } else if (rightWasActive) {
+            builder.addStroke(buildEndStroke(rightJoystick));
+            rightJoystick.activeStroke = null;
+            rightJoystick.lastPoint = null;
+            anyStroke = true;
+        }
+
+        if (anyStroke) {
+            dispatchGesture(builder.build(), null, null);
+        }
     }
 
     /**
-     * 用「延續手勢」的方式模擬手指持續按著搖桿並移動：
-     * 每次收到新的搖桿數值，就從上一個點延伸一小段路徑到新的點。
+     * 建立/延續一段搖桿移動用的手勢片段，起點是這根搖桿上一次移動到的位置（沒有的話用中心點當起點）。
      * 注意：continueStroke 要求新路徑的起點必須等於前一段路徑的終點，否則會丟例外。
      */
-    private void updateJoystickGesture(float x, float y) {
-        PointF from = (lastJoystickPoint != null) ? lastJoystickPoint : joystickAnchor;
-
+    private GestureDescription.StrokeDescription buildMoveStroke(JoystickState state, PointF anchorFallback, float toX, float toY) {
+        PointF from = (state.lastPoint != null) ? state.lastPoint : anchorFallback;
         Path path = new Path();
         path.moveTo(from.x, from.y);
-        path.lineTo(x, y);
+        path.lineTo(toX, toY);
 
-        GestureDescription.StrokeDescription stroke;
-        if (activeJoystickStroke == null) {
-            stroke = new GestureDescription.StrokeDescription(path, 0, JOYSTICK_UPDATE_DURATION_MS, true);
-        } else {
-            stroke = activeJoystickStroke.continueStroke(path, 0, JOYSTICK_UPDATE_DURATION_MS, true);
+        if (state.activeStroke == null) {
+            return new GestureDescription.StrokeDescription(path, 0, JOYSTICK_UPDATE_DURATION_MS, true);
         }
-
-        GestureDescription gesture = new GestureDescription.Builder().addStroke(stroke).build();
-        boolean dispatched = dispatchGesture(gesture, null, null);
-        if (dispatched) {
-            activeJoystickStroke = stroke;
-            lastJoystickPoint = new PointF(x, y);
-        }
+        return state.activeStroke.continueStroke(path, 0, JOYSTICK_UPDATE_DURATION_MS, true);
     }
 
-    /** 搖桿回到中立位置時，結束手勢（相當於放開手指） */
-    private void releaseJoystick() {
-        if (activeJoystickStroke == null || lastJoystickPoint == null) return;
-
+    /** 搖桿回到中立位置時，結束這根手指的手勢（相當於放開手指），原地放開、長度為 0 */
+    private GestureDescription.StrokeDescription buildEndStroke(JoystickState state) {
+        PointF p = state.lastPoint;
         Path path = new Path();
-        path.moveTo(lastJoystickPoint.x, lastJoystickPoint.y);
-        path.lineTo(lastJoystickPoint.x, lastJoystickPoint.y); // 原地放開，長度為 0
+        path.moveTo(p.x, p.y);
+        path.lineTo(p.x, p.y);
+        return state.activeStroke.continueStroke(path, 0, 1, false);
+    }
 
-        GestureDescription.StrokeDescription stroke =
-                activeJoystickStroke.continueStroke(path, 0, 1, false);
-        dispatchGesture(new GestureDescription.Builder().addStroke(stroke).build(), null, null);
+    /** 關閉搖桿收訊前呼叫：把左右兩根搖桿還在進行中的手勢一起收尾，避免手指卡在畫面上 */
+    private void releaseAllJoysticks() {
+        boolean leftActive = leftJoystick.activeStroke != null;
+        boolean rightActive = rightJoystick.activeStroke != null;
+        if (!leftActive && !rightActive) return;
 
-        activeJoystickStroke = null;
-        lastJoystickPoint = null;
+        GestureDescription.Builder builder = new GestureDescription.Builder();
+        if (leftActive) {
+            builder.addStroke(buildEndStroke(leftJoystick));
+            leftJoystick.activeStroke = null;
+            leftJoystick.lastPoint = null;
+        }
+        if (rightActive) {
+            builder.addStroke(buildEndStroke(rightJoystick));
+            rightJoystick.activeStroke = null;
+            rightJoystick.lastPoint = null;
+        }
+        dispatchGesture(builder.build(), null, null);
         lastJoystickDispatchTime = 0L;
     }
 

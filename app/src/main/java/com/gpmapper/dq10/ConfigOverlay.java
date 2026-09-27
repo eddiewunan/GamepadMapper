@@ -10,6 +10,7 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import java.util.LinkedHashMap;
@@ -23,10 +24,10 @@ import java.util.Map;
  * 這樣不管進入設定模式當下手機是直的還是橫的（例如橫向遊戲），
  * 標記都會依照當下實際的螢幕寬高比例分佈，不會因為方向不同而跑到畫面外或擠成一團。
  *
- * ★ 重要修正：建構時會傳入 MappingStore，若某個按鍵之前已經存過座標，
- * 標記會直接顯示在「上次存的位置」，而不是每次都重畫成預設位置──
- * 之前的版本沒有做這一步，導致每次重新打開設定模式，畫面看起來就像是
- * 之前存的位置「還原了」，其實是介面根本沒有把已存的資料讀進來顯示。
+ * 建構時會傳入 MappingStore，若某個按鍵之前已經存過座標，標記會直接顯示在「上次存的位置」。
+ * 畫面下方另外有一顆「還原預設」按鈕，可以把所有標記重新排回預設的百分比位置，
+ * 方便設錯了想重來；要注意這個「還原」只是重排畫面上的標記，
+ * 真正生效還是要再按一次「儲存位置」才會寫回 MappingStore。
  */
 public class ConfigOverlay extends FrameLayout {
 
@@ -35,7 +36,11 @@ public class ConfigOverlay extends FrameLayout {
     }
 
     private final Map<Integer, TextView> markers = new LinkedHashMap<>();
-    private final TextView joystickMarker;
+    private final Map<Integer, PointF> defaultPositions = new LinkedHashMap<>(); // 每顆標記的預設(左上角)座標，供「還原預設」使用
+    private final TextView joystickMarker;      // 左搖桿中心
+    private final TextView rightJoystickMarker; // 右搖桿中心
+    private final PointF joystickDefaultPos;
+    private final PointF rightJoystickDefaultPos;
     private OnSaveListener saveListener;
 
     public ConfigOverlay(Context context, MappingStore store) {
@@ -60,9 +65,12 @@ public class ConfigOverlay extends FrameLayout {
         addMarker(KeyEvent.KEYCODE_BUTTON_X, "X", pct(w, 0.78f), pct(h, 0.65f), Color.RED, store);
         addMarker(KeyEvent.KEYCODE_BUTTON_Y, "Y", pct(w, 0.85f), pct(h, 0.55f), Color.RED, store);
 
-        // START / SELECT（畫面上方中間附近）
-        addMarker(KeyEvent.KEYCODE_BUTTON_START, "START", pct(w, 0.55f), pct(h, 0.08f), Color.RED, store);
-        addMarker(KeyEvent.KEYCODE_BUTTON_SELECT, "SELECT", pct(w, 0.42f), pct(h, 0.08f), Color.RED, store);
+        // ST / SL（START / SELECT 縮寫，避免文字太長），放在畫面上方中間附近
+        addMarker(KeyEvent.KEYCODE_BUTTON_START, "ST", pct(w, 0.55f), pct(h, 0.08f), Color.RED, store);
+        addMarker(KeyEvent.KEYCODE_BUTTON_SELECT, "SL", pct(w, 0.42f), pct(h, 0.08f), Color.RED, store);
+
+        // MD（KEYCODE_BUTTON_MODE = 110），一般點擊按鍵
+        addMarker(KeyEvent.KEYCODE_BUTTON_MODE, "MD", pct(w, 0.48f), pct(h, 0.18f), Color.RED, store);
 
         // L1/R1：一般點擊按鍵，放在畫面左右上角
         addMarker(KeyEvent.KEYCODE_BUTTON_L1, "L1", pct(w, 0.04f), pct(h, 0.06f), Color.RED, store);
@@ -73,27 +81,54 @@ public class ConfigOverlay extends FrameLayout {
         addMarker(KeyEvent.KEYCODE_BUTTON_L2, "L2(左滑)", pct(w, 0.04f), pct(h, 0.18f), Color.MAGENTA, store);
         addMarker(KeyEvent.KEYCODE_BUTTON_R2, "R2(右滑)", pct(w, 0.92f), pct(h, 0.18f), Color.MAGENTA, store);
 
-        // 搖桿錨點標記（左搖桿的中心點，也就是遊戲畫面上虛擬搖桿的原點）
+        // 左搖桿錨點標記（藍色）
         joystickMarker = new TextView(context);
-        joystickMarker.setText("搖桿中心");
+        joystickMarker.setText("左搖桿中心");
         styleMarker(joystickMarker, Color.BLUE);
         addView(joystickMarker, new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
-        joystickMarker.setX(pct(w, 0.20f));
-        joystickMarker.setY(pct(h, 0.55f));
+        joystickDefaultPos = new PointF(pct(w, 0.20f), pct(h, 0.55f));
+        joystickMarker.setX(joystickDefaultPos.x);
+        joystickMarker.setY(joystickDefaultPos.y);
         makeDraggable(joystickMarker);
-
         PointF savedAnchor = store.getJoystickAnchor();
         if (savedAnchor != null) {
             centerMarkerOnceLaidOut(joystickMarker, savedAnchor);
         }
 
-        // 儲存按鈕，固定在畫面底部中間
+        // 右搖桿錨點標記（青色，跟左搖桿的藍色區分）
+        rightJoystickMarker = new TextView(context);
+        rightJoystickMarker.setText("右搖桿中心");
+        styleMarker(rightJoystickMarker, Color.CYAN);
+        rightJoystickMarker.setTextColor(Color.BLACK); // 青色底用黑字比較清楚
+        addView(rightJoystickMarker, new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
+        rightJoystickDefaultPos = new PointF(pct(w, 0.72f), pct(h, 0.55f));
+        rightJoystickMarker.setX(rightJoystickDefaultPos.x);
+        rightJoystickMarker.setY(rightJoystickDefaultPos.y);
+        makeDraggable(rightJoystickMarker);
+        PointF savedRightAnchor = store.getRightJoystickAnchor();
+        if (savedRightAnchor != null) {
+            centerMarkerOnceLaidOut(rightJoystickMarker, savedRightAnchor);
+        }
+
+        // 底部按鈕列：還原預設 + 儲存位置，並排放在畫面底部中間
+        LinearLayout buttonRow = new LinearLayout(context);
+        buttonRow.setOrientation(LinearLayout.HORIZONTAL);
+        LayoutParams rowLp = new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT);
+        rowLp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+        rowLp.bottomMargin = 60;
+        addView(buttonRow, rowLp);
+
+        Button resetBtn = new Button(context);
+        resetBtn.setText("還原預設");
+        buttonRow.addView(resetBtn);
+        resetBtn.setOnClickListener(v -> resetAllToDefault());
+
         Button saveBtn = new Button(context);
         saveBtn.setText("儲存位置");
-        LayoutParams lp = new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT);
-        lp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
-        lp.bottomMargin = 60;
-        addView(saveBtn, lp);
+        LinearLayout.LayoutParams saveLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        saveLp.leftMargin = 24;
+        buttonRow.addView(saveBtn, saveLp);
         saveBtn.setOnClickListener(v -> {
             if (saveListener != null) saveListener.onSave();
         });
@@ -112,6 +147,7 @@ public class ConfigOverlay extends FrameLayout {
         tv.setY(defaultY);
         makeDraggable(tv);
         markers.put(keyCode, tv);
+        defaultPositions.put(keyCode, new PointF(defaultX, defaultY));
 
         // 如果這顆按鍵之前已經存過座標，等這個 View 排版完成後，把它移到「上次存的位置」，
         // 而不是停留在剛剛設的預設位置。
@@ -131,6 +167,21 @@ public class ConfigOverlay extends FrameLayout {
             view.setX(centerPoint.x - view.getWidth() / 2f);
             view.setY(centerPoint.y - view.getHeight() / 2f);
         });
+    }
+
+    /** 把所有標記（含左右搖桿中心）重新排回預設的百分比位置，只影響畫面顯示，要再按「儲存位置」才會真正寫入 */
+    private void resetAllToDefault() {
+        for (Map.Entry<Integer, TextView> entry : markers.entrySet()) {
+            PointF def = defaultPositions.get(entry.getKey());
+            if (def != null) {
+                entry.getValue().setX(def.x);
+                entry.getValue().setY(def.y);
+            }
+        }
+        joystickMarker.setX(joystickDefaultPos.x);
+        joystickMarker.setY(joystickDefaultPos.y);
+        rightJoystickMarker.setX(rightJoystickDefaultPos.x);
+        rightJoystickMarker.setY(rightJoystickDefaultPos.y);
     }
 
     private void styleMarker(TextView tv, int color) {
@@ -178,5 +229,9 @@ public class ConfigOverlay extends FrameLayout {
         float jx = joystickMarker.getX() + joystickMarker.getWidth() / 2f;
         float jy = joystickMarker.getY() + joystickMarker.getHeight() / 2f;
         store.saveJoystickAnchor(jx, jy, store.getJoystickRadius());
+
+        float rjx = rightJoystickMarker.getX() + rightJoystickMarker.getWidth() / 2f;
+        float rjy = rightJoystickMarker.getY() + rightJoystickMarker.getHeight() / 2f;
+        store.saveRightJoystickAnchor(rjx, rjy);
     }
 }

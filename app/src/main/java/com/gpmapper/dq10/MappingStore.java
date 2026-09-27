@@ -17,6 +17,8 @@ public class MappingStore {
     private static final String KEY_JOY_ANCHOR_X = "joy_anchor_x";
     private static final String KEY_JOY_ANCHOR_Y = "joy_anchor_y";
     private static final String KEY_JOY_RADIUS = "joy_radius";
+    private static final String KEY_JOY_R_ANCHOR_X = "joy_anchor_right_x";
+    private static final String KEY_JOY_R_ANCHOR_Y = "joy_anchor_right_y";
     private static final float DEFAULT_JOY_RADIUS = 150f; // 預設搖桿可拖曳半徑（像素）
 
     private final SharedPreferences prefs;
@@ -55,6 +57,19 @@ public class MappingStore {
 
     public float getJoystickRadius() {
         return prefs.getFloat(KEY_JOY_RADIUS, DEFAULT_JOY_RADIUS);
+    }
+
+    /** 右搖桿的中心點，跟左搖桿共用同一個可拖曳半徑（joy_radius） */
+    public void saveRightJoystickAnchor(float x, float y) {
+        prefs.edit()
+                .putFloat(KEY_JOY_R_ANCHOR_X, x)
+                .putFloat(KEY_JOY_R_ANCHOR_Y, y)
+                .apply();
+    }
+
+    public PointF getRightJoystickAnchor() {
+        if (!prefs.contains(KEY_JOY_R_ANCHOR_X)) return null;
+        return new PointF(prefs.getFloat(KEY_JOY_R_ANCHOR_X, 0), prefs.getFloat(KEY_JOY_R_ANCHOR_Y, 0));
     }
 
     /** 載入所有已設定的按鍵座標，回傳 keyCode -> PointF 的對照表 */
