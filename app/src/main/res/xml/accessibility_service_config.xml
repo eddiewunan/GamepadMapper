@@ -4,5 +4,6 @@
     android:accessibilityFeedbackType="feedbackGeneric"
     android:accessibilityFlags="flagRequestFilterKeyEvents|flagDefault"
     android:canRequestFilterKeyEvents="true"
+    android:canPerformGestures="true"
     android:notificationTimeout="0"
     android:description="@string/accessibility_service_description" />
