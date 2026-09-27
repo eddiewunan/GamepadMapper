@@ -65,6 +65,7 @@ public class GamepadMapperService extends AccessibilityService {
 
     private ConfigOverlay configOverlay;   // 設定模式時顯示的可拖曳標記層
     private boolean inConfigMode = false;
+    private boolean joystickWasEnabledBeforeConfig = false; // 進設定模式前搖桿原本的開關狀態，離開後要還原
 
     private TextView testLabel;            // 測試模式用的小提示框，顯示即時 keyCode/軸值
     private boolean testMode = false;
@@ -154,10 +155,15 @@ public class GamepadMapperService extends AccessibilityService {
         inConfigMode = !inConfigMode;
         refreshButtonLabels();
         if (inConfigMode) {
+            // 記住目前搖桿的開關狀態，離開設定模式後要還原回這個狀態，而不是永遠變成關閉
+            joystickWasEnabledBeforeConfig = joystickCaptureEnabled;
             setJoystickCaptureEnabled(false); // 設定模式下不需要搖桿收訊，避免互相干擾
             showConfigOverlay();
         } else {
             hideConfigOverlay();
+            if (joystickWasEnabledBeforeConfig) {
+                setJoystickCaptureEnabled(true); // 還原成進設定模式之前的狀態
+            }
         }
     }
 
@@ -206,7 +212,7 @@ public class GamepadMapperService extends AccessibilityService {
     }
 
     private void showConfigOverlay() {
-        configOverlay = new ConfigOverlay(this);
+        configOverlay = new ConfigOverlay(this, mappingStore);
         configOverlay.setOnSaveListener(() -> {
             configOverlay.saveAllPositions(mappingStore);
             reloadMapping();

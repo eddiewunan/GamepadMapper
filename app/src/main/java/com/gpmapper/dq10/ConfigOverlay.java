@@ -2,13 +2,12 @@ package com.gpmapper.dq10;
 
 import android.content.Context;
 import android.graphics.Color;
-import android.graphics.Point;
+import android.graphics.PointF;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
-import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.TextView;
@@ -23,7 +22,11 @@ import java.util.Map;
  * 標記的預設位置是用「螢幕寬高的百分比」計算，而不是寫死的像素值，
  * 這樣不管進入設定模式當下手機是直的還是橫的（例如橫向遊戲），
  * 標記都會依照當下實際的螢幕寬高比例分佈，不會因為方向不同而跑到畫面外或擠成一團。
- * 最終位置仍然以你實際拖曳存檔的座標為準。
+ *
+ * ★ 重要修正：建構時會傳入 MappingStore，若某個按鍵之前已經存過座標，
+ * 標記會直接顯示在「上次存的位置」，而不是每次都重畫成預設位置──
+ * 之前的版本沒有做這一步，導致每次重新打開設定模式，畫面看起來就像是
+ * 之前存的位置「還原了」，其實是介面根本沒有把已存的資料讀進來顯示。
  */
 public class ConfigOverlay extends FrameLayout {
 
@@ -35,7 +38,7 @@ public class ConfigOverlay extends FrameLayout {
     private final TextView joystickMarker;
     private OnSaveListener saveListener;
 
-    public ConfigOverlay(Context context) {
+    public ConfigOverlay(Context context, MappingStore store) {
         super(context);
         setBackgroundColor(Color.argb(60, 0, 0, 0)); // 半透明背景，提示目前在設定模式
 
@@ -46,29 +49,29 @@ public class ConfigOverlay extends FrameLayout {
         int h = dm.heightPixels;
 
         // 方向鍵（左下區域，模擬十字鍵慣用位置）
-        addMarker(KeyEvent.KEYCODE_DPAD_UP, "上", pct(w, 0.28f), pct(h, 0.65f), Color.RED);
-        addMarker(KeyEvent.KEYCODE_DPAD_DOWN, "下", pct(w, 0.28f), pct(h, 0.85f), Color.RED);
-        addMarker(KeyEvent.KEYCODE_DPAD_LEFT, "左", pct(w, 0.20f), pct(h, 0.75f), Color.RED);
-        addMarker(KeyEvent.KEYCODE_DPAD_RIGHT, "右", pct(w, 0.36f), pct(h, 0.75f), Color.RED);
+        addMarker(KeyEvent.KEYCODE_DPAD_UP, "上", pct(w, 0.28f), pct(h, 0.65f), Color.RED, store);
+        addMarker(KeyEvent.KEYCODE_DPAD_DOWN, "下", pct(w, 0.28f), pct(h, 0.85f), Color.RED, store);
+        addMarker(KeyEvent.KEYCODE_DPAD_LEFT, "左", pct(w, 0.20f), pct(h, 0.75f), Color.RED, store);
+        addMarker(KeyEvent.KEYCODE_DPAD_RIGHT, "右", pct(w, 0.36f), pct(h, 0.75f), Color.RED, store);
 
         // 功能按鍵（右下區域，模擬 A/B/X/Y 慣用位置）
-        addMarker(KeyEvent.KEYCODE_BUTTON_A, "A", pct(w, 0.85f), pct(h, 0.75f), Color.RED);
-        addMarker(KeyEvent.KEYCODE_BUTTON_B, "B", pct(w, 0.92f), pct(h, 0.65f), Color.RED);
-        addMarker(KeyEvent.KEYCODE_BUTTON_X, "X", pct(w, 0.78f), pct(h, 0.65f), Color.RED);
-        addMarker(KeyEvent.KEYCODE_BUTTON_Y, "Y", pct(w, 0.85f), pct(h, 0.55f), Color.RED);
+        addMarker(KeyEvent.KEYCODE_BUTTON_A, "A", pct(w, 0.85f), pct(h, 0.75f), Color.RED, store);
+        addMarker(KeyEvent.KEYCODE_BUTTON_B, "B", pct(w, 0.92f), pct(h, 0.65f), Color.RED, store);
+        addMarker(KeyEvent.KEYCODE_BUTTON_X, "X", pct(w, 0.78f), pct(h, 0.65f), Color.RED, store);
+        addMarker(KeyEvent.KEYCODE_BUTTON_Y, "Y", pct(w, 0.85f), pct(h, 0.55f), Color.RED, store);
 
         // START / SELECT（畫面上方中間附近）
-        addMarker(KeyEvent.KEYCODE_BUTTON_START, "START", pct(w, 0.55f), pct(h, 0.08f), Color.RED);
-        addMarker(KeyEvent.KEYCODE_BUTTON_SELECT, "SELECT", pct(w, 0.42f), pct(h, 0.08f), Color.RED);
+        addMarker(KeyEvent.KEYCODE_BUTTON_START, "START", pct(w, 0.55f), pct(h, 0.08f), Color.RED, store);
+        addMarker(KeyEvent.KEYCODE_BUTTON_SELECT, "SELECT", pct(w, 0.42f), pct(h, 0.08f), Color.RED, store);
 
         // L1/R1：一般點擊按鍵，放在畫面左右上角
-        addMarker(KeyEvent.KEYCODE_BUTTON_L1, "L1", pct(w, 0.04f), pct(h, 0.06f), Color.RED);
-        addMarker(KeyEvent.KEYCODE_BUTTON_R1, "R1", pct(w, 0.92f), pct(h, 0.06f), Color.RED);
+        addMarker(KeyEvent.KEYCODE_BUTTON_L1, "L1", pct(w, 0.04f), pct(h, 0.06f), Color.RED, store);
+        addMarker(KeyEvent.KEYCODE_BUTTON_R1, "R1", pct(w, 0.92f), pct(h, 0.06f), Color.RED, store);
 
         // L2/R2：固定為「拖曳手勢」的起點，L2 放開後會模擬向左滑，R2 模擬向右滑，
         // 用紫色跟一般點擊按鍵（紅色）區分，避免使用者誤以為它們是單純點擊。
-        addMarker(KeyEvent.KEYCODE_BUTTON_L2, "L2(左滑)", pct(w, 0.04f), pct(h, 0.18f), Color.MAGENTA);
-        addMarker(KeyEvent.KEYCODE_BUTTON_R2, "R2(右滑)", pct(w, 0.92f), pct(h, 0.18f), Color.MAGENTA);
+        addMarker(KeyEvent.KEYCODE_BUTTON_L2, "L2(左滑)", pct(w, 0.04f), pct(h, 0.18f), Color.MAGENTA, store);
+        addMarker(KeyEvent.KEYCODE_BUTTON_R2, "R2(右滑)", pct(w, 0.92f), pct(h, 0.18f), Color.MAGENTA, store);
 
         // 搖桿錨點標記（左搖桿的中心點，也就是遊戲畫面上虛擬搖桿的原點）
         joystickMarker = new TextView(context);
@@ -78,6 +81,11 @@ public class ConfigOverlay extends FrameLayout {
         joystickMarker.setX(pct(w, 0.20f));
         joystickMarker.setY(pct(h, 0.55f));
         makeDraggable(joystickMarker);
+
+        PointF savedAnchor = store.getJoystickAnchor();
+        if (savedAnchor != null) {
+            centerMarkerOnceLaidOut(joystickMarker, savedAnchor);
+        }
 
         // 儲存按鈕，固定在畫面底部中間
         Button saveBtn = new Button(context);
@@ -95,7 +103,7 @@ public class ConfigOverlay extends FrameLayout {
         return total * fraction;
     }
 
-    private void addMarker(int keyCode, String label, float defaultX, float defaultY, int color) {
+    private void addMarker(int keyCode, String label, float defaultX, float defaultY, int color, MappingStore store) {
         TextView tv = new TextView(getContext());
         tv.setText(label);
         styleMarker(tv, color);
@@ -104,6 +112,25 @@ public class ConfigOverlay extends FrameLayout {
         tv.setY(defaultY);
         makeDraggable(tv);
         markers.put(keyCode, tv);
+
+        // 如果這顆按鍵之前已經存過座標，等這個 View 排版完成後，把它移到「上次存的位置」，
+        // 而不是停留在剛剛設的預設位置。
+        PointF saved = store.getButtonPosition(keyCode);
+        if (saved != null) {
+            centerMarkerOnceLaidOut(tv, saved);
+        }
+    }
+
+    /**
+     * 儲存的座標是「標記中心點」，但 setX/setY 設的是左上角，
+     * 而 View 的寬高要等排版完成（layout pass）之後 getWidth()/getHeight() 才會有正確值，
+     * 所以用 post() 排到下一輪主執行緒工作，確保這時候寬高已經量測完成。
+     */
+    private void centerMarkerOnceLaidOut(TextView view, PointF centerPoint) {
+        view.post(() -> {
+            view.setX(centerPoint.x - view.getWidth() / 2f);
+            view.setY(centerPoint.y - view.getHeight() / 2f);
+        });
     }
 
     private void styleMarker(TextView tv, int color) {
