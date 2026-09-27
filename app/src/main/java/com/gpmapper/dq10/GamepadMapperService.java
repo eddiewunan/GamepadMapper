@@ -55,6 +55,7 @@ public class GamepadMapperService extends AccessibilityService {
 
     private static final float JOYSTICK_DEADZONE = 0.25f;
     private static final long JOYSTICK_UPDATE_DURATION_MS = 60L; // 每段延續手勢的持續時間
+    private static final long JOYSTICK_MIN_INTERVAL_MS = JOYSTICK_UPDATE_DURATION_MS; // 兩次送出的最短間隔，避免積壓佇列
     private static final long TAP_DURATION_MS = 50L;
     private static final float SWIPE_DISTANCE_PX = 300f;  // L2/R2 觸發的滑動距離
     private static final long SWIPE_DURATION_MS = 120L;   // L2/R2 滑動手勢的持續時間
@@ -83,6 +84,7 @@ public class GamepadMapperService extends AccessibilityService {
     // 搖桿目前正在進行中的手勢，用來延續拖曳動作；lastJoystickPoint 記錄上一段路徑的終點
     private GestureDescription.StrokeDescription activeJoystickStroke;
     private PointF lastJoystickPoint;
+    private long lastJoystickDispatchTime = 0L; // 節流用：避免同時塞太多段延續手勢造成佇列積壓
 
     @Override
     protected void onServiceConnected() {
@@ -289,15 +291,25 @@ public class GamepadMapperService extends AccessibilityService {
 
     private void handleJoystickMotion(MotionEvent event) {
         if (testMode) {
-            // 測試模式：把搖桿與十字鍵可能用到的軸值都顯示出來，方便確認手把實際送出的是哪一種訊號
-            // （某些手把的十字鍵是用 HAT 軸而不是按鍵事件送出，這裡可以直接看出來）
+            // 測試模式：把左搖桿、右搖桿、十字鍵、L2/R2 扳機可能用到的軸都顯示出來，
+            // 方便確認手把實際送出的是哪一種訊號、對應到哪個軸代碼。
+            // （不同手把/模式下，右搖桿可能是 AXIS_Z/AXIS_RZ 或 AXIS_RX/AXIS_RY；
+            //   扳機可能是 AXIS_LTRIGGER/AXIS_RTRIGGER 或 AXIS_BRAKE/AXIS_GAS，因裝置而異）
             float x = event.getAxisValue(MotionEvent.AXIS_X);
             float y = event.getAxisValue(MotionEvent.AXIS_Y);
+            float z = event.getAxisValue(MotionEvent.AXIS_Z);
+            float rz = event.getAxisValue(MotionEvent.AXIS_RZ);
+            float rx = event.getAxisValue(MotionEvent.AXIS_RX);
+            float ry = event.getAxisValue(MotionEvent.AXIS_RY);
             float hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X);
             float hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y);
+            float lTrigger = event.getAxisValue(MotionEvent.AXIS_LTRIGGER);
+            float rTrigger = event.getAxisValue(MotionEvent.AXIS_RTRIGGER);
+            float brake = event.getAxisValue(MotionEvent.AXIS_BRAKE);
+            float gas = event.getAxisValue(MotionEvent.AXIS_GAS);
             showTestInfo(String.format(
-                    "搖桿軸值\nAXIS_X=%.2f AXIS_Y=%.2f\nHAT_X=%.2f HAT_Y=%.2f",
-                    x, y, hatX, hatY));
+                    "左類比 X=%.2f Y=%.2f\nZ=%.2f RZ=%.2f\nRX=%.2f RY=%.2f\nHAT_X=%.2f HAT_Y=%.2f\nLT=%.2f RT=%.2f\nBRAKE=%.2f GAS=%.2f",
+                    x, y, z, rz, rx, ry, hatX, hatY, lTrigger, rTrigger, brake, gas));
             return; // 測試模式下不觸發實際手勢
         }
 
@@ -308,9 +320,19 @@ public class GamepadMapperService extends AccessibilityService {
         float magnitude = (float) Math.sqrt(x * x + y * y);
 
         if (magnitude < JOYSTICK_DEADZONE) {
-            releaseJoystick();
+            releaseJoystick(); // 放開一定要立刻處理，不能被節流卡住，否則會延遲收尾
             return;
         }
+
+        // 節流：搖桿的 onGenericMotionEvent 觸發頻率遠高於每段延續手勢的播放時間（60ms），
+        // 如果每次收到訊號都塞一段新的手勢進去，快速畫一圈就會瞬間塞進十幾段，
+        // 系統必須照順序全部播完才會輪到「放開」那一下，變成放開後畫面還在「補動作」。
+        // 所以這裡限制送出頻率，跟每段手勢的播放時間對齊，避免佇列越疊越多。
+        long now = System.currentTimeMillis();
+        if (now - lastJoystickDispatchTime < JOYSTICK_MIN_INTERVAL_MS) {
+            return;
+        }
+        lastJoystickDispatchTime = now;
 
         // 超過搖桿最大幅度時做正規化，避免超出可拖曳半徑
         if (magnitude > 1f) {
@@ -364,6 +386,7 @@ public class GamepadMapperService extends AccessibilityService {
 
         activeJoystickStroke = null;
         lastJoystickPoint = null;
+        lastJoystickDispatchTime = 0L;
     }
 
     @Override
