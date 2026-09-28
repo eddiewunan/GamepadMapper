@@ -1,1 +1,11 @@
+# Android 檔案管理 App 覆蓋檔案時產生的回收暫存檔（會造成編譯出現重複類別錯誤）
 .trashed-*
+**/.trashed-*
+
+# Gradle / Android Studio 產生的檔案
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+.DS_Store

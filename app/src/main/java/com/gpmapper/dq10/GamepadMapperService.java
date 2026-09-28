@@ -7,6 +7,8 @@ import android.graphics.Color;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
 import android.graphics.PointF;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.Gravity;
 import android.view.InputDevice;
 import android.view.KeyEvent;
@@ -17,7 +19,10 @@ import android.view.accessibility.AccessibilityEvent;
 import android.widget.TextView;
 
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 手把映射核心服務：
@@ -86,6 +91,9 @@ public class GamepadMapperService extends AccessibilityService {
 
     private MappingStore mappingStore;
     private Map<Integer, PointF> buttonMap = new HashMap<>();
+    private Map<Integer, List<MappingStore.MacroStep>> macroMap = new HashMap<>(); // 已啟用巨集的按鍵 -> 步驟清單
+    private final Handler macroHandler = new Handler(Looper.getMainLooper());
+    private final Set<Integer> runningMacros = new HashSet<>(); // 正在執行中的巨集，避免同一顆按鍵連按造成重疊
     private PointF joystickAnchor;       // 左搖桿中心（AXIS_X / AXIS_Y）
     private PointF rightJoystickAnchor;  // 右搖桿中心（AXIS_Z / AXIS_RZ）
     private float joystickRadius;
@@ -117,6 +125,7 @@ public class GamepadMapperService extends AccessibilityService {
 
     private void reloadMapping() {
         buttonMap = mappingStore.loadAllButtons(SUPPORTED_KEYCODES);
+        macroMap = mappingStore.loadEnabledMacros(SUPPORTED_KEYCODES);
         joystickAnchor = mappingStore.getJoystickAnchor();
         rightJoystickAnchor = mappingStore.getRightJoystickAnchor();
         joystickRadius = mappingStore.getJoystickRadius();
@@ -294,11 +303,13 @@ public class GamepadMapperService extends AccessibilityService {
             return true;
         }
 
-        PointF target = buttonMap.get(event.getKeyCode());
-        if (target == null) return false; // 這個按鍵還沒設定位置，交還給系統預設處理
+        int keyCode = event.getKeyCode();
+        boolean hasMacro = macroMap.containsKey(keyCode);
+        boolean hasTap = buttonMap.containsKey(keyCode);
+        if (!hasMacro && !hasTap) return false; // 這個按鍵還沒設定過，交還給系統預設處理
 
         if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
-            dispatchTap(target); // 所有按鍵（含 L2/R2）統一為單點點擊
+            triggerKey(keyCode);
         }
         return true; // 消費掉這個按鍵事件
     }
@@ -360,9 +371,44 @@ public class GamepadMapperService extends AccessibilityService {
         boolean wasAtTrigger = Math.abs(previousValue - triggerValue) < HAT_TRIGGER_THRESHOLD;
         boolean isAtTrigger = Math.abs(currentValue - triggerValue) < HAT_TRIGGER_THRESHOLD;
         if (!wasAtTrigger && isAtTrigger) {
-            PointF target = buttonMap.get(keyCode);
-            if (target != null) dispatchTap(target);
+            triggerKey(keyCode); // 十字鍵也支援巨集，跟一般按鍵走同一套邏輯
         }
+    }
+
+    /**
+     * 按鍵被觸發時的統一入口：如果這顆按鍵啟用了巨集就執行巨集，否則走原本的單擊映射。
+     * 一般按鍵（onKeyEvent）與十字鍵（HAT 軸）都會呼叫這裡。
+     */
+    private void triggerKey(int keyCode) {
+        List<MappingStore.MacroStep> steps = macroMap.get(keyCode);
+        if (steps != null && !steps.isEmpty()) {
+            runMacro(keyCode, steps);
+            return;
+        }
+        PointF target = buttonMap.get(keyCode);
+        if (target != null) dispatchTap(target);
+    }
+
+    /**
+     * 依序執行巨集：點擊第 1 步位置 -> 等待 -> 點擊第 2 步位置 -> ...
+     * 每一步的開始時間 = 前一步開始時間 + 點擊本身的持續時間 + 前一步設定的等待時間，
+     * 這樣前一步的點擊一定已經結束才會開始下一步，不會因為「新手勢打斷前一個手勢」而漏掉動作。
+     * 巨集執行期間，同一顆按鍵再按會被忽略；最後一步之後的等待時間不會生效。
+     * 注意：巨集裡的每一步點擊都是獨立的 dispatchGesture 呼叫，
+     * 如果同時有搖桿正在拖曳，可能會被打斷（跟一般按鍵的既有限制相同）。
+     */
+    private void runMacro(int keyCode, List<MappingStore.MacroStep> steps) {
+        if (!runningMacros.add(keyCode)) return; // 這顆按鍵的巨集還在跑，忽略這次觸發
+
+        long startTime = 0L;
+        for (int i = 0; i < steps.size(); i++) {
+            MappingStore.MacroStep step = steps.get(i);
+            macroHandler.postDelayed(() -> dispatchTap(new PointF(step.x, step.y)), startTime);
+            startTime += TAP_DURATION_MS;
+            if (i < steps.size() - 1) startTime += step.delayMs;
+        }
+        // 全部步驟結束後才解除「執行中」狀態
+        macroHandler.postDelayed(() -> runningMacros.remove(keyCode), startTime);
     }
 
     /**
@@ -520,6 +566,7 @@ public class GamepadMapperService extends AccessibilityService {
             if (testLabel != null) windowManager.removeView(testLabel);
             hideConfigOverlay();
         }
+        macroHandler.removeCallbacksAndMessages(null); // 取消還沒執行的巨集步驟
     }
 
     /**
