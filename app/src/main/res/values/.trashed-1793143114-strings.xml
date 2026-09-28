@@ -1,4 +1,0 @@
-<resources>
-    <string name="app_name">手把映射 for DQ10</string>
-    <string name="accessibility_service_description">攔截手把按鍵與搖桿訊號，轉換成觸控操作，讓不支援手把的遊戲也能用手把玩。</string>
-</resources>
