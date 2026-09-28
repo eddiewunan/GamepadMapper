@@ -21,11 +21,10 @@ import java.util.Map;
 
 /**
  * 手把映射核心服務：
- * 1. 用 onKeyEvent 攔截手把離散按鍵（A/B/X/Y/L1/R1/L2/R2/MODE…），轉成螢幕上固定座標的點擊。
+ * 1. 用 onKeyEvent 攔截手把離散按鍵（DPAD/A/B/X/Y/L1/R1/L2/R2/MODE…），轉成螢幕上固定座標的點擊或滑動。
  *    這部分完全不需要 focus，隨時都在運作，不影響系統其他操作。
- * 2. 用一個可取得 focus 的透明懸浮視窗接收類比訊號（onGenericMotionEvent）：
- *    左右搖桿（AXIS_X/Y、AXIS_Z/RZ）用「延續中的手勢」模擬手指按住拖曳；
- *    十字鍵在這隻手把上是走 HAT_X/HAT_Y 軸（不是按鍵事件），用邊緣觸發的方式偵測方向變化，觸發一次點擊。
+ * 2. 用一個可取得 focus 的透明懸浮視窗接收左右搖桿的類比訊號（onGenericMotionEvent），
+ *    再用「延續中的手勢（continued gesture）」模擬手指按住拖曳，達成搖桿移動效果。
  *    左右搖桿若同時操作，會合併進「同一次」dispatchGesture 呼叫，
  *    因為 Android 一次手勢呼叫代表當下所有手指的狀態，分開呼叫會讓後面那次打斷前一個。
  *    ★ 這個視窗會搶走系統 focus，導致遊戲畫面可能整個變黑、系統手勢返回/長按失效，
@@ -35,7 +34,6 @@ import java.util.Map;
  *
  * 這三個功能（搖桿收訊、設定模式、測試模式）統一用「常駐的懸浮小按鈕」開關，
  * 不需要離開目前的遊戲、也不需要切換 App，直接在遊戲畫面上點懸浮按鈕即可切換。
- * 進入設定模式或測試模式前，都會記住搖桿收訊原本的開關狀態，離開後自動還原，而不是永遠關閉。
  *
  * 已知限制（實測前務必留意）：
  * - 開啟搖桿收訊的當下，遊戲視窗一定會失去 focus；如果遊戲對 focus 遺失敏感
@@ -44,8 +42,6 @@ import java.util.Map;
  *   按鍵點擊目前是獨立呼叫 dispatchGesture，若跟搖桿拖曳同時觸發，可能會互相打斷。
  * - L2/R2 若是手把上的類比扳機，系統可能只會送出瞬間的 DOWN+UP，收不到「持續按住」的狀態，
  *   這種情況下無法做出真正的長按效果，是 Android 輸入框架的限制，不是本 App 的 bug。
- * - 所有懸浮視窗都加了「忽略螢幕安全邊界內縮」的旗標，讓畫面座標盡量對齊實際觸控注入時
- *   系統使用的原始座標系統，避免因為瀏海/圓角/黑邊裁切造成的座標系統不一致。
  */
 public class GamepadMapperService extends AccessibilityService {
 
@@ -65,10 +61,11 @@ public class GamepadMapperService extends AccessibilityService {
     private static final long JOYSTICK_UPDATE_DURATION_MS = 60L; // 每段延續手勢的持續時間
     private static final long JOYSTICK_MIN_INTERVAL_MS = JOYSTICK_UPDATE_DURATION_MS; // 兩次送出的最短間隔，避免積壓佇列
     private static final long TAP_DURATION_MS = 50L;
-    private static final float HAT_TRIGGER_THRESHOLD = 0.5f; // HAT 軸判定「有壓到某個方向」的門檻
+    private static final float SWIPE_DISTANCE_PX = 300f;  // L2/R2 觸發的滑動距離
+    private static final long SWIPE_DURATION_MS = 120L;   // L2/R2 滑動手勢的持續時間
 
     private WindowManager windowManager;
-    private View joystickCaptureView;      // 只在手動開啟時才存在：拿 focus 收搖桿/十字鍵訊號
+    private View joystickCaptureView;      // 只在手動開啟時才存在：拿 focus 收搖桿訊號
     private boolean joystickCaptureEnabled = false;
 
     private ConfigOverlay configOverlay;   // 設定模式時顯示的可拖曳標記層
@@ -77,7 +74,6 @@ public class GamepadMapperService extends AccessibilityService {
 
     private TextView testLabel;            // 測試模式用的小提示框，顯示即時 keyCode/軸值
     private boolean testMode = false;
-    private boolean joystickWasEnabledBeforeTest = false; // 進測試模式前搖桿原本的開關狀態，離開後要還原
 
     // 常駐的三顆懸浮控制鈕：搖桿收訊 / 設定模式 / 測試模式，全部 FLAG_NOT_FOCUSABLE，不影響系統操作
     private FloatingButton joystickButton;
@@ -91,10 +87,6 @@ public class GamepadMapperService extends AccessibilityService {
     private float joystickRadius;
 
     private long lastJoystickDispatchTime = 0L; // 節流用：避免同時塞太多段延續手勢造成佇列積壓
-
-    // 十字鍵目前的 HAT 軸狀態，用來判斷「剛從中立變成按到某個方向」的那一瞬間（邊緣觸發）
-    private float lastHatX = 0f;
-    private float lastHatY = 0f;
 
     /** 每根搖桿各自的手勢延續狀態（左右各一份，才能同時拖著兩個點移動） */
     private static class JoystickState {
@@ -122,26 +114,11 @@ public class GamepadMapperService extends AccessibilityService {
         joystickRadius = mappingStore.getJoystickRadius();
     }
 
-    /**
-     * 幫懸浮視窗的 LayoutParams 加上「忽略螢幕安全邊界內縮」的旗標，
-     * 讓視窗盡量佔滿原始物理螢幕（包含瀏海/圓角/黑邊區域），
-     * 避免視窗座標系統跟 dispatchGesture 實際注入觸控時用的座標系統不一致，
-     * 這是為了解決「畫面上設定的位置」跟「實際觸發位置」有固定偏移量的問題。
-     */
-    private void applyFullScreenFlags(WindowManager.LayoutParams params) {
-        params.flags |= WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS;
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
-            params.layoutInDisplayCutoutMode =
-                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
-        }
-    }
-
     /** 建立三顆常駐懸浮控制鈕，垂直排列在畫面左側，可各自拖曳到不擋視線的位置 */
     private void addControlButtons() {
         joystickButton = new FloatingButton(200, () -> setJoystickCaptureEnabled(!joystickCaptureEnabled));
         configButton = new FloatingButton(280, this::toggleConfigMode);
-        testButton = new FloatingButton(360, this::toggleTestMode);
+        testButton = new FloatingButton(360, () -> setTestModeEnabled(!testMode));
         refreshButtonLabels();
     }
 
@@ -173,7 +150,6 @@ public class GamepadMapperService extends AccessibilityService {
                     PixelFormat.TRANSLUCENT);
             // 注意：這裡刻意「不」加 FLAG_NOT_FOCUSABLE，因為需要拿到 focus 才收得到搖桿類比訊號，
             // 開啟期間遊戲視窗會失去 focus，是目前非 root 方案無法繞開的取捨，所以才做成手動開關。
-            applyFullScreenFlags(params);
             windowManager.addView(joystickCaptureView, params);
         } else {
             releaseAllJoysticks(); // 關閉前先把還在進行中的拖曳手勢收尾，避免手指卡在畫面上
@@ -208,22 +184,21 @@ public class GamepadMapperService extends AccessibilityService {
     /**
      * 測試模式：手把按什麼鍵、搖桿/十字鍵推到哪個數值，都會即時顯示在畫面小提示框上，
      * 但不會真的觸發點擊/滑動手勢，避免測試時誤觸遊戲畫面。
-     * 開啟測試模式會順便打開搖桿收訊（因為要測到類比軸的數值），
-     * 關閉時會還原成「進測試模式之前」搖桿原本的開關狀態，而不是永遠關閉。
+     * 開啟測試模式會順便打開搖桿收訊（因為要測到類比軸的數值），關閉時一併關掉。
      */
-    private void toggleTestMode() {
-        testMode = !testMode;
+    private void setTestModeEnabled(boolean enabled) {
+        if (enabled == testMode) return;
+        testMode = enabled;
         refreshButtonLabels();
 
-        if (testMode) {
-            joystickWasEnabledBeforeTest = joystickCaptureEnabled;
+        if (enabled) {
             addTestLabelIfNeeded();
             testLabel.setVisibility(View.VISIBLE);
             setJoystickCaptureEnabled(true);
             showTestInfo("測試模式已開啟\n按手把按鍵，或推動搖桿/十字鍵看看數值");
         } else {
             if (testLabel != null) testLabel.setVisibility(View.GONE);
-            setJoystickCaptureEnabled(joystickWasEnabledBeforeTest); // 還原成進測試模式之前的狀態
+            setJoystickCaptureEnabled(false);
         }
     }
 
@@ -243,7 +218,6 @@ public class GamepadMapperService extends AccessibilityService {
                 PixelFormat.TRANSLUCENT);
         params.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
         params.y = 100;
-        applyFullScreenFlags(params);
         windowManager.addView(testLabel, params);
     }
 
@@ -265,7 +239,6 @@ public class GamepadMapperService extends AccessibilityService {
                 WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, // 設定模式不需要攔截搖桿，讓標記可以正常觸控拖曳
                 PixelFormat.TRANSLUCENT);
-        applyFullScreenFlags(params);
         windowManager.addView(configOverlay, params);
     }
 
@@ -298,7 +271,13 @@ public class GamepadMapperService extends AccessibilityService {
         if (target == null) return false; // 這個按鍵還沒設定位置，交還給系統預設處理
 
         if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
-            dispatchTap(target); // 所有按鍵（含 L2/R2）統一為單點點擊
+            if (event.getKeyCode() == KeyEvent.KEYCODE_BUTTON_L2) {
+                dispatchSwipe(target, -1); // 向左滑
+            } else if (event.getKeyCode() == KeyEvent.KEYCODE_BUTTON_R2) {
+                dispatchSwipe(target, 1);  // 向右滑
+            } else {
+                dispatchTap(target);
+            }
         }
         return true; // 消費掉這個按鍵事件
     }
@@ -310,6 +289,16 @@ public class GamepadMapperService extends AccessibilityService {
                 new GestureDescription.StrokeDescription(path, 0, TAP_DURATION_MS);
         GestureDescription gesture = new GestureDescription.Builder().addStroke(stroke).build();
         dispatchGesture(gesture, null, null);
+    }
+
+    /** L2/R2 專用：從設定的起點做一個固定距離的橫向滑動（快速拖曳），direction 為 -1（左）或 1（右） */
+    private void dispatchSwipe(PointF start, int direction) {
+        Path path = new Path();
+        path.moveTo(start.x, start.y);
+        path.lineTo(start.x + direction * SWIPE_DISTANCE_PX, start.y);
+        GestureDescription.StrokeDescription stroke =
+                new GestureDescription.StrokeDescription(path, 0, SWIPE_DURATION_MS);
+        dispatchGesture(new GestureDescription.Builder().addStroke(stroke).build(), null, null);
     }
 
     private void handleJoystickMotion(MotionEvent event) {
@@ -334,35 +323,7 @@ public class GamepadMapperService extends AccessibilityService {
             return; // 測試模式下不觸發實際手勢
         }
 
-        handleDpadHat(event);
         handleRealJoystickMotion(event);
-    }
-
-    /**
-     * 十字鍵在這隻手把上是走 HAT_X/HAT_Y 軸（數值只有 -1/0/1），不是按鍵事件。
-     * 用「邊緣觸發」的方式偵測：從中立(0)變成某個方向(±1)的那一瞬間，觸發一次點擊，
-     * 行為跟原本用按鍵事件做的十字鍵一樣是單點點擊，不是持續拖曳。
-     */
-    private void handleDpadHat(MotionEvent event) {
-        float hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X);
-        float hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y);
-
-        checkHatEdge(lastHatX, hatX, -1f, KeyEvent.KEYCODE_DPAD_LEFT);
-        checkHatEdge(lastHatX, hatX, 1f, KeyEvent.KEYCODE_DPAD_RIGHT);
-        checkHatEdge(lastHatY, hatY, -1f, KeyEvent.KEYCODE_DPAD_UP);
-        checkHatEdge(lastHatY, hatY, 1f, KeyEvent.KEYCODE_DPAD_DOWN);
-
-        lastHatX = hatX;
-        lastHatY = hatY;
-    }
-
-    private void checkHatEdge(float previousValue, float currentValue, float triggerValue, int keyCode) {
-        boolean wasAtTrigger = Math.abs(previousValue - triggerValue) < HAT_TRIGGER_THRESHOLD;
-        boolean isAtTrigger = Math.abs(currentValue - triggerValue) < HAT_TRIGGER_THRESHOLD;
-        if (!wasAtTrigger && isAtTrigger) {
-            PointF target = buttonMap.get(keyCode);
-            if (target != null) dispatchTap(target);
-        }
     }
 
     /**
@@ -438,19 +399,8 @@ public class GamepadMapperService extends AccessibilityService {
             anyStroke = true;
         }
 
-        if (!anyStroke) return;
-
-        boolean dispatched = dispatchGesture(builder.build(), null, null);
-        if (!dispatched) {
-            // 自我修復：如果這次呼叫被系統拒絕，代表剛剛記錄的「延續中」狀態其實沒有真的生效，
-            // 若不重置，下一次會拿一個系統根本不認得的 StrokeDescription 去呼叫 continueStroke，
-            // 導致那根搖桿的手勢鏈永久卡死（這可能就是「左右搖桿不能同時推」的原因之一）。
-            // 這裡直接整組重置，讓兩根搖桿下次都從「重新按下」開始，至少不會卡死。
-            leftJoystick.activeStroke = null;
-            leftJoystick.lastPoint = null;
-            rightJoystick.activeStroke = null;
-            rightJoystick.lastPoint = null;
-            lastJoystickDispatchTime = 0L;
+        if (anyStroke) {
+            dispatchGesture(builder.build(), null, null);
         }
     }
 
@@ -545,7 +495,6 @@ public class GamepadMapperService extends AccessibilityService {
             params.gravity = Gravity.TOP | Gravity.START;
             params.x = 0;
             params.y = defaultYPx;
-            applyFullScreenFlags(params);
 
             view.setOnTouchListener(new View.OnTouchListener() {
                 float downRawX, downRawY, downX, downY;

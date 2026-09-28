@@ -1,0 +1,42 @@
+apply plugin: 'com.android.application'
+
+android {
+    namespace 'com.gpmapper.dq10'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.gpmapper.dq10"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    // 固定簽名憑證：debug.keystore 是專案自帶的檔案（不是雲端每次自動產生的），
+    // 這樣每次在 GitHub Actions 上重新編譯，簽名都一樣，才能用「安裝更新」而不用每次解除安裝重裝。
+    signingConfigs {
+        debug {
+            storeFile file("debug.keystore")
+            storePassword "android"
+            keyAlias "androiddebugkey"
+            keyPassword "android"
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
+        }
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+}

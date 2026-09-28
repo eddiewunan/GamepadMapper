@@ -76,9 +76,10 @@ public class ConfigOverlay extends FrameLayout {
         addMarker(KeyEvent.KEYCODE_BUTTON_L1, "L1", pct(w, 0.04f), pct(h, 0.06f), Color.RED, store);
         addMarker(KeyEvent.KEYCODE_BUTTON_R1, "R1", pct(w, 0.92f), pct(h, 0.06f), Color.RED, store);
 
-        // L2/R2：跟 L1/R1 一樣是一般點擊按鍵（之前的「滑動手勢」設計已取消）
-        addMarker(KeyEvent.KEYCODE_BUTTON_L2, "L2", pct(w, 0.04f), pct(h, 0.18f), Color.RED, store);
-        addMarker(KeyEvent.KEYCODE_BUTTON_R2, "R2", pct(w, 0.92f), pct(h, 0.18f), Color.RED, store);
+        // L2/R2：固定為「拖曳手勢」的起點，L2 放開後會模擬向左滑，R2 模擬向右滑，
+        // 用紫色跟一般點擊按鍵（紅色）區分，避免使用者誤以為它們是單純點擊。
+        addMarker(KeyEvent.KEYCODE_BUTTON_L2, "L2(左滑)", pct(w, 0.04f), pct(h, 0.18f), Color.MAGENTA, store);
+        addMarker(KeyEvent.KEYCODE_BUTTON_R2, "R2(右滑)", pct(w, 0.92f), pct(h, 0.18f), Color.MAGENTA, store);
 
         // 左搖桿錨點標記（藍色）
         joystickMarker = new TextView(context);
