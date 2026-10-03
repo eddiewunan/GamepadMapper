@@ -292,16 +292,17 @@ public class GamepadMapperService extends AccessibilityService {
         int source = event.getSource();
         boolean isGamepadKey = (source & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
                 || (source & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK;
-        if (!isGamepadKey) return false;
 
         if (testMode) {
-            // 測試模式：只顯示這顆按鍵實際送出的 keyCode，不做任何映射動作
-            String actionName = (event.getAction() == KeyEvent.ACTION_DOWN) ? "DOWN" : "UP";
-            showTestInfo("按鍵事件\nkeyCode=" + event.getKeyCode()
-                    + "\n名稱=" + KeyEvent.keyCodeToString(event.getKeyCode())
-                    + "\n動作=" + actionName);
-            return true;
+            // 測試模式：不管來源類型，所有按鍵事件都顯示（包含 keyCode=0 的未知按鍵），
+            // 這樣才分得出「手把真的沒送訊號」跟「訊號來源類型不是手把而被過濾掉」。
+            // 只有手把來源的事件會被消費；其他來源（例如音量鍵、返回鍵）只顯示、不攔截，
+            // 否則測試期間手機的實體按鍵會全部失效。
+            showKeyTestInfo(event, isGamepadKey);
+            return isGamepadKey;
         }
+
+        if (!isGamepadKey) return false;
 
         int keyCode = event.getKeyCode();
         boolean hasMacro = macroMap.containsKey(keyCode);
@@ -323,6 +324,55 @@ public class GamepadMapperService extends AccessibilityService {
         dispatchGesture(gesture, null, null);
     }
 
+    /** 測試模式專用：顯示一個按鍵事件的完整資訊，方便辨識背鍵這類沒有標準代碼的按鍵 */
+    private void showKeyTestInfo(KeyEvent event, boolean isGamepadKey) {
+        String actionName = (event.getAction() == KeyEvent.ACTION_DOWN) ? "DOWN" : "UP";
+        InputDevice device = event.getDevice();
+        String deviceName = (device != null) ? device.getName() : "未知";
+        showTestInfo("按鍵事件" + (isGamepadKey ? "" : "（非手把來源，未攔截）")
+                + "\nkeyCode=" + event.getKeyCode()
+                + "\n名稱=" + KeyEvent.keyCodeToString(event.getKeyCode())
+                + "\nscanCode=" + event.getScanCode()
+                + "\n動作=" + actionName
+                + "\n來源=0x" + Integer.toHexString(event.getSource())
+                + "\n裝置=" + deviceName);
+    }
+
+    /**
+     * 測試模式專用：列出「上面已經顯示的標準軸以外」、目前數值明顯不是 0 的軸。
+     * 有些手把的額外按鍵（例如背鍵）不是用按鍵事件，而是用 AXIS_GENERIC_1～16 這類軸送出，
+     * 這樣可以直接看出來。
+     */
+    private String describeOtherAxes(MotionEvent event) {
+        int[] shown = {
+                MotionEvent.AXIS_X, MotionEvent.AXIS_Y, MotionEvent.AXIS_Z, MotionEvent.AXIS_RZ,
+                MotionEvent.AXIS_RX, MotionEvent.AXIS_RY, MotionEvent.AXIS_HAT_X, MotionEvent.AXIS_HAT_Y,
+                MotionEvent.AXIS_LTRIGGER, MotionEvent.AXIS_RTRIGGER, MotionEvent.AXIS_BRAKE, MotionEvent.AXIS_GAS
+        };
+        InputDevice device = event.getDevice();
+        if (device == null) return "其他軸：（無裝置資訊）";
+
+        StringBuilder sb = new StringBuilder();
+        for (InputDevice.MotionRange range : device.getMotionRanges()) {
+            int axis = range.getAxis();
+            boolean alreadyShown = false;
+            for (int a : shown) {
+                if (a == axis) {
+                    alreadyShown = true;
+                    break;
+                }
+            }
+            if (alreadyShown) continue;
+
+            float value = event.getAxisValue(axis);
+            if (Math.abs(value) > 0.05f) {
+                if (sb.length() > 0) sb.append(' ');
+                sb.append(MotionEvent.axisToString(axis)).append('=').append(String.format("%.2f", value));
+            }
+        }
+        return "其他軸：" + (sb.length() == 0 ? "（無）" : sb.toString());
+    }
+
     private void handleJoystickMotion(MotionEvent event) {
         if (testMode) {
             // 測試模式：把左搖桿、右搖桿、十字鍵、L2/R2 扳機可能用到的軸都顯示出來，
@@ -341,7 +391,9 @@ public class GamepadMapperService extends AccessibilityService {
             float gas = event.getAxisValue(MotionEvent.AXIS_GAS);
             showTestInfo(String.format(
                     "左類比 X=%.2f Y=%.2f\nZ=%.2f RZ=%.2f\nRX=%.2f RY=%.2f\nHAT_X=%.2f HAT_Y=%.2f\nLT=%.2f RT=%.2f\nBRAKE=%.2f GAS=%.2f",
-                    x, y, z, rz, rx, ry, hatX, hatY, lTrigger, rTrigger, brake, gas));
+                    x, y, z, rz, rx, ry, hatX, hatY, lTrigger, rTrigger, brake, gas)
+                    + "\n" + describeOtherAxes(event)
+                    + "\n來源=0x" + Integer.toHexString(event.getSource()));
             return; // 測試模式下不觸發實際手勢
         }
 
